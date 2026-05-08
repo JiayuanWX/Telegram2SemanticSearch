@@ -1,0 +1,225 @@
+import argparse
+import asyncio
+import json
+import os
+from dataclasses import asdict, dataclass
+from datetime import datetime
+from typing import Any, Dict, List, Optional
+
+from dotenv import load_dotenv
+from telethon import TelegramClient
+from telethon.tl.types import Message, MessageMediaDocument, MessageMediaPhoto, MessageMediaWebPage
+
+
+@dataclass
+class SenderInfo:
+    id: Optional[int]
+    username: Optional[str]
+    first_name: Optional[str]
+    last_name: Optional[str]
+
+
+def parse_sender(message: Message) -> SenderInfo:
+    sender = getattr(message, "sender", None)
+    if sender is not None:
+        return SenderInfo(
+            id=getattr(sender, "id", None),
+            username=getattr(sender, "username", None),
+            first_name=getattr(sender, "first_name", None),
+            last_name=getattr(sender, "last_name", None),
+        )
+
+    from_id = getattr(message, "from_id", None)
+    if from_id is not None:
+        if hasattr(from_id, "user_id"):
+            return SenderInfo(id=from_id.user_id, username=None, first_name=None, last_name=None)
+        return SenderInfo(id=from_id, username=None, first_name=None, last_name=None)
+
+    return SenderInfo(id=None, username=None, first_name=None, last_name=None)
+
+
+def parse_reactions(message: Message) -> Optional[Dict[str, Any]]:
+    reactions = getattr(message, "reactions", None)
+    if not reactions:
+        return None
+
+    def serialize_reaction_value(value: Any) -> Any:
+        if value is None:
+            return None
+        if isinstance(value, (str, int, float, bool)):
+            return value
+        if hasattr(value, "emoticon"):
+            return getattr(value, "emoticon")
+        if hasattr(value, "text"):
+            return getattr(value, "text")
+        return str(value)
+
+    result_counts = getattr(reactions, "results", []) or []
+    total = getattr(reactions, "count", getattr(reactions, "total", None))
+    if total is None:
+        total = sum(getattr(item, "count", 0) for item in result_counts)
+
+    return {
+        "total": total,
+        "items": [
+            {
+                "emoji": serialize_reaction_value(getattr(item, "reaction", None)),
+                "count": getattr(item, "count", None),
+                "is_chosen": getattr(item, "chosen_order", None) is not None,
+            }
+            for item in result_counts
+        ],
+    }
+
+
+def parse_media(message: Message) -> Optional[Dict[str, Any]]:
+    media = getattr(message, "media", None)
+    if media is None:
+        return None
+
+    media_info: Dict[str, Any] = {"type": type(media).__name__}
+
+    if isinstance(media, MessageMediaPhoto):
+        photo = getattr(media, "photo", None)
+        if photo is not None:
+            media_info.update(
+                {
+                    "photo_id": getattr(photo, "id", None),
+                    "sizes": [
+                        {
+                            "type": getattr(size, "type", None),
+                            "width": getattr(size, "w", None),
+                            "height": getattr(size, "h", None),
+                            "file_size": getattr(size, "size", None),
+                        }
+                        for size in getattr(photo, "sizes", [])
+                    ],
+                }
+            )
+
+    elif isinstance(media, MessageMediaDocument):
+        document = getattr(media, "document", None)
+        if document is not None:
+            media_info.update(
+                {
+                    "document_id": getattr(document, "id", None),
+                    "mime_type": getattr(document, "mime_type", None),
+                    "file_name": getattr(document, "attributes", None),
+                    "size": getattr(document, "size", None),
+                }
+            )
+            if getattr(document, "attributes", None):
+                media_info["attributes"] = [
+                    {"type": type(attr).__name__, **{"file_name": getattr(attr, "file_name", None)}}
+                    for attr in getattr(document, "attributes", [])
+                ]
+
+    elif isinstance(media, MessageMediaWebPage):
+        webpage = getattr(media, "webpage", None)
+        if webpage is not None:
+            media_info.update(
+                {
+                    "url": getattr(webpage, "url", None),
+                    "display_url": getattr(webpage, "display_url", None),
+                    "type_name": getattr(webpage, "type", None),
+                    "title": getattr(webpage, "title", None),
+                    "description": getattr(webpage, "description", None),
+                }
+            )
+
+    return media_info
+
+
+def message_to_dict(message: Message) -> Dict[str, Any]:
+    sender = parse_sender(message)
+    result: Dict[str, Any] = {
+        "id": message.id,
+        "date": message.date.isoformat() if getattr(message, "date", None) else None,
+        "sender": asdict(sender),
+        "text": message.message,
+        "raw_text": getattr(message, "raw_text", None),
+        "reply_to": getattr(message, "reply_to_msg_id", None),
+        "grouped_id": getattr(message, "grouped_id", None),
+        "forward": getattr(message, "fwd_from", None) is not None,
+        "reactions": parse_reactions(message),
+        "media": parse_media(message),
+        "entities": [
+            {"type": type(entity).__name__, "offset": entity.offset, "length": entity.length}
+            for entity in (getattr(message, "entities", []) or [])
+        ],
+    }
+
+    if getattr(message, "forward", None):
+        result["forwarded_from_user_id"] = getattr(message.forward, "from_id", None)
+
+    return result
+
+
+async def backup_group_messages(
+    api_id: int,
+    api_hash: str,
+    phone: str,
+    group: str,
+    output_file: str,
+) -> None:
+    client = TelegramClient("telegram_backup_session", api_id, api_hash)
+    await client.start(phone=phone)
+
+    entity = await client.get_entity(group)
+    print(f"Connected. Fetching messages from: {getattr(entity, 'title', getattr(entity, 'username', str(entity)))}")
+
+    messages: List[Dict[str, Any]] = []
+    async for message in client.iter_messages(entity, reverse=True):
+        if not isinstance(message, Message):
+            continue
+        messages.append(message_to_dict(message))
+
+    print(f"Fetched {len(messages)} messages. Writing to {output_file}.")
+
+    with open(output_file, "w", encoding="utf-8") as fp:
+        json.dump(messages, fp, ensure_ascii=False, indent=2)
+
+    print("Backup complete.")
+
+
+def load_config() -> Dict[str, Any]:
+    load_dotenv()
+    return {
+        "api_id": int(os.environ["API_ID"]),
+        "api_hash": os.environ["API_HASH"],
+        "phone": os.environ["PHONE"],
+        "group": os.environ["GROUP"],
+    }
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Backup Telegram group messages to JSON.")
+    parser.add_argument(
+        "--output",
+        default="backup.json",
+        help="Path to the output JSON file (default: backup.json)",
+    )
+    parser.add_argument(
+        "--copy-session",
+        action="store_true",
+        help="Keep the Telethon session file after the backup is complete.",
+    )
+    args = parser.parse_args()
+
+    config = load_config()
+    output_file = args.output
+
+    try:
+        asyncio.run(backup_group_messages(config["api_id"], config["api_hash"], config["phone"], config["group"], output_file))
+    except KeyboardInterrupt:
+        print("Backup interrupted.")
+        raise
+
+    if not args.copy_session:
+        session_path = "telegram_backup_session.session"
+        if os.path.exists(session_path):
+            os.remove(session_path)
+
+
+if __name__ == "__main__":
+    main()
