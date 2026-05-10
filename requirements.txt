@@ -2,3 +2,7 @@ telethon>=1.30.0
 python-dotenv>=1.0.0
 aiohttp 
 beautifulsoup4
+qdrant_client
+sentence_transformers
+tf_keras
+torch
