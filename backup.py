@@ -162,11 +162,8 @@ def message_to_dict(message: Message, topic_ids: set) -> Dict[str, Any]:
         "date": message.date.isoformat() if getattr(message, "date", None) else None,
         "sender": asdict(sender),
         "text": message.message,
-        "raw_text": getattr(message, "raw_text", None),
         "reply_to": reply_to_msg_id,
         "topic_id": topic_id,
-        "grouped_id": getattr(message, "grouped_id", None),
-        "forward": getattr(message, "fwd_from", None) is not None,
         "reactions": parse_reactions(message),
         "media": parse_media(message),
         "entities": [
@@ -189,7 +186,7 @@ async def backup_group_messages(
     output_file: str,
     target_topic_id: Optional[int] = None,
 ) -> None:
-    client = TelegramClient("telegram_backup_session", api_id, api_hash)
+    client = TelegramClient("tg_backup_session", api_id, api_hash)
     await client.start(phone=phone)
 
     entity = await client.get_entity(group)
@@ -247,11 +244,6 @@ def main() -> None:
         type=int,
         help="ID of the topic to backup",
     )
-    parser.add_argument(
-        "--copy-session",
-        action="store_true",
-        help="Keep the Telethon session file after the backup is complete.",
-    )
     args = parser.parse_args()
 
     config = load_config()
@@ -269,11 +261,6 @@ def main() -> None:
     except KeyboardInterrupt:
         print("Backup interrupted.")
         raise
-
-    if not args.copy_session:
-        session_path = "telegram_backup_session.session"
-        if os.path.exists(session_path):
-            os.remove(session_path)
 
 
 if __name__ == "__main__":
