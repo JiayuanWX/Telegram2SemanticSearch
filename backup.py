@@ -198,8 +198,6 @@ async def backup_group_messages(
         if msg.action and hasattr(msg.action, "title"):
             topic_ids.add(msg.id)
     
-    print(f"Found {len(topic_ids)} topics.")
-
     messages: List[Dict[str, Any]] = []
     async for message in client.iter_messages(entity, reverse=True):
         if not isinstance(message, Message):
@@ -224,11 +222,21 @@ async def backup_group_messages(
 
 def load_config() -> Dict[str, Any]:
     load_dotenv()
+    group_val = os.environ["GROUP"]
+    try:
+        # Intenta convertir a int si empieza con '-' o es puramente numérico
+        if group_val.startswith("-") or group_val.isdigit():
+            group = int(group_val)
+        else:
+            group = group_val
+    except ValueError:
+        group = group_val
+
     return {
         "api_id": int(os.environ["API_ID"]),
         "api_hash": os.environ["API_HASH"],
         "phone": os.environ["PHONE"],
-        "group": os.environ["GROUP"],
+        "group": group,
     }
 
 
