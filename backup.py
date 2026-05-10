@@ -2,6 +2,7 @@ import argparse
 import asyncio
 import json
 import os
+import re
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from typing import Any, Dict, List, Optional
@@ -182,35 +183,82 @@ async def backup_group_messages(
     api_id: int,
     api_hash: str,
     phone: str,
-    group: str,
-    output_file: str,
+    group: Any,
+    output_file: Optional[str] = None,
     target_topic_id: Optional[int] = None,
+    limit: Optional[int] = None,
+    no_media: bool = False,
+    start_date: Optional[datetime] = None,
+    end_date: Optional[datetime] = None,
 ) -> None:
     client = TelegramClient("tg_backup_session", api_id, api_hash)
     await client.start(phone=phone)
 
     entity = await client.get_entity(group)
-    print(f"Connected. Fetching messages from: {getattr(entity, 'title', getattr(entity, 'username', str(entity)))}")
+    group_title = getattr(entity, "title", "UnknownGroup")
+    print(f"Connected. Fetching messages from: {group_title}")
 
-    # Obtener IDs de tópicos (mensajes de servicio que crean tópicos)
-    topic_ids = set()
+    # Obtener IDs de tópicos y sus nombres
+    topic_ids = {}
     async for msg in client.iter_messages(entity):
         if msg.action and hasattr(msg.action, "title"):
-            topic_ids.add(msg.id)
+            topic_ids[msg.id] = msg.action.title
     
+    # El topic 1 suele ser "General"
+    if 1 not in topic_ids:
+        topic_ids[1] = "General"
+
+    topic_name = "All"
+    if target_topic_id:
+        topic_name = topic_ids.get(target_topic_id, f"Topic_{target_topic_id}")
+
+    # Construir nombre de archivo si no se proporciona
+    if not output_file:
+        safe_group = re.sub(r'[^\w\-]', '_', group_title)
+        safe_topic = re.sub(r'[^\w\-]', '_', topic_name)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_file = os.path.join("backup", f"{safe_group}_{safe_topic}_{timestamp}.json")
+
+    # Asegurar que el directorio de backup existe
+    os.makedirs(os.path.dirname(output_file) if os.path.dirname(output_file) else "backup", exist_ok=True)
+
     messages: List[Dict[str, Any]] = []
-    async for message in client.iter_messages(entity, reverse=True):
+    count = 0
+    
+    # iter_messages soporta offset_date (end) pero no directamente start_date de forma inclusiva inversa fácilmente
+    # Usaremos el filtrado manual para mayor precisión con los criterios solicitados
+    
+    async for message in client.iter_messages(entity, reverse=True, limit=None):
         if not isinstance(message, Message):
             continue
             
-        msg_dict = message_to_dict(message, topic_ids)
+        # Filtro de fecha
+        msg_date = message.date.replace(tzinfo=None) if message.date else None
+        if start_date and msg_date and msg_date < start_date:
+            continue
+        if end_date and msg_date and msg_date > end_date:
+            continue
+
+        msg_dict = message_to_dict(message, set(topic_ids.keys()))
         
         # Filtrar por tópico si se especifica
         if target_topic_id is not None:
-            if msg_dict["topic_id"] != target_topic_id and msg_dict["id"] != target_topic_id:
+            # Si buscamos el tópico 1 (General), a veces los mensajes no tienen topic_id o es 1
+            if target_topic_id == 1:
+                if msg_dict["topic_id"] is not None and msg_dict["topic_id"] != 1:
+                    continue
+            elif msg_dict["topic_id"] != target_topic_id and msg_dict["id"] != target_topic_id:
                 continue
-                
+        
+        # Filtro de media
+        if no_media:
+            msg_dict["media"] = None
+
         messages.append(msg_dict)
+        count += 1
+        
+        if limit and count >= limit:
+            break
 
     print(f"Fetched {len(messages)} messages. Writing to {output_file}.")
 
@@ -244,18 +292,39 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Backup Telegram group messages to JSON.")
     parser.add_argument(
         "--output",
-        default="backup.json",
-        help="Path to the output JSON file (default: backup.json)",
+        help="Path to the output JSON file. If omitted, structured name is used.",
     )
     parser.add_argument(
         "--topic",
         type=int,
         help="ID of the topic to backup",
     )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        help="Maximum number of messages to fetch",
+    )
+    parser.add_argument(
+        "--no-media",
+        action="store_true",
+        help="Do not include media information in the backup",
+    )
+    parser.add_argument(
+        "--start",
+        help="Start date in YYYY-MM-DD format",
+    )
+    parser.add_argument(
+        "--end",
+        help="End date in YYYY-MM-DD format",
+    )
     args = parser.parse_args()
 
     config = load_config()
-    output_file = args.output
+    
+    start_date = datetime.strptime(args.start, "%Y-%m-%d") if args.start else None
+    end_date = datetime.strptime(args.end, "%Y-%m-%d") if args.end else None
+    if end_date:
+        end_date = end_date.replace(hour=23, minute=59, second=59)
 
     try:
         asyncio.run(backup_group_messages(
@@ -263,8 +332,12 @@ def main() -> None:
             config["api_hash"], 
             config["phone"], 
             config["group"], 
-            output_file,
-            target_topic_id=args.topic
+            output_file=args.output,
+            target_topic_id=args.topic,
+            limit=args.limit,
+            no_media=args.no_media,
+            start_date=start_date,
+            end_date=end_date
         ))
     except KeyboardInterrupt:
         print("Backup interrupted.")
