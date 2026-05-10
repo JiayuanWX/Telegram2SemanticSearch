@@ -5,48 +5,117 @@ import asyncio
 import aiohttp
 from bs4 import BeautifulSoup
 from datetime import datetime
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
+
+async def fetch_with_playwright(url: str) -> Optional[str]:
+    """Fallback using playwright to handle JS-heavy or protected sites."""
+    try:
+        from playwright.async_api import async_playwright
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=True)
+            page = await browser.new_page()
+            # Set a realistic user agent
+            await page.set_extra_http_headers({
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            })
+            await page.goto(url, wait_until="networkidle", timeout=30000)
+            
+            # Try to get og:description, then twitter:description, then title
+            description = await page.evaluate("""() => {
+                const getMeta = (name) => {
+                    const el = document.querySelector(`meta[property="${name}"]`) || document.querySelector(`meta[name="${name}"]`);
+                    return el ? el.content : null;
+                };
+                return getMeta('og:description') || getMeta('twitter:description') || getMeta('description') || document.title;
+            }""")
+            
+            await browser.close()
+            return description.strip() if description else None
+    except Exception as e:
+        print(f"Playwright fallback failed for {url}: {e}")
+        return None
 
 async def fetch_url_info(session: aiohttp.ClientSession, url: str, date: str) -> Dict[str, Any]:
     original_url = url
     fetched_url = url
     
-    # Rewrite x.com or twitter.com to fixupx.com
+    # Twitter handling - only using fixupx.com, no rotation, no playwright fallback
     if "x.com" in url or "twitter.com" in url:
         fetched_url = url.replace("twitter.com", "fixupx.com").replace("x.com", "fixupx.com")
+        # Minimal headers to avoid 400 Bad Request
+        minimal_headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        }
+        try:
+            async with session.get(fetched_url, timeout=10, allow_redirects=True, headers=minimal_headers) as response:
+                if response.status == 200:
+                    html = await response.text()
+                    soup = BeautifulSoup(html, 'html.parser')
+                    meta_desc = (
+                        soup.find("meta", property="og:description") or 
+                        soup.find("meta", attrs={"name": "twitter:description"}) or
+                        soup.find("meta", attrs={"name": "description"})
+                    )
+                    if meta_desc and meta_desc.get("content"):
+                        return {
+                            "original_url": original_url,
+                            "fetched_url": fetched_url,
+                            "date": date,
+                            "description": meta_desc["content"].strip()
+                        }
+            print(f"Failed to fetch {original_url} via fixupx.com")
+            return None
+        except Exception as e:
+            print(f"Error fetching {original_url} via fixupx: {e}")
+            return None
     
     try:
-        # fixvx/vxtwitter/fixupx often requires a proper User-Agent
-        async with session.get(fetched_url, timeout=15, allow_redirects=True) as response:
+        # Standard fallback for non-Twitter URLs
+        async with session.get(url, timeout=15, allow_redirects=True) as response:
+            if response.status in [403, 401]:
+                print(f"Status {response.status} for {url}. Trying playwright fallback...")
+                pw_desc = await fetch_with_playwright(url)
+                if pw_desc:
+                    return {
+                        "original_url": original_url,
+                        "fetched_url": url,
+                        "date": date,
+                        "description": pw_desc
+                    }
+                return None
+            
             if response.status != 200:
-                print(f"Status {response.status} for {fetched_url}")
+                print(f"Status {response.status} for {url}")
                 return None
             
             html = await response.text()
             soup = BeautifulSoup(html, 'html.parser')
             
-            description = ""
-            if any(p in fetched_url for p in ["fixvx.com", "vxtwitter.com", "fxtwitter.com", "fixupx.com"]):
-                # These services use og:description for the tweet content
-                meta_desc = (
-                    soup.find("meta", property="og:description") or 
-                    soup.find("meta", attrs={"name": "twitter:description"}) or
-                    soup.find("meta", attrs={"name": "description"})
-                )
-                
-                description = meta_desc["content"] if meta_desc else "No description found"
-            else:
-                # Other URLs: grab the page title
-                description = soup.title.string if soup.title else "No title found"
+            # For general sites, title is often more reliable than meta if meta is missing
+            meta_desc = (
+                soup.find("meta", property="og:description") or 
+                soup.find("meta", attrs={"name": "twitter:description"}) or
+                soup.find("meta", attrs={"name": "description"})
+            )
+            
+            description = meta_desc["content"] if meta_desc and meta_desc.get("content") else (soup.title.string if soup.title else "No description found")
             
             return {
                 "original_url": original_url,
-                "fetched_url": fetched_url,
+                "fetched_url": url,
                 "date": date,
                 "description": description.strip()
             }
     except Exception as e:
-        print(f"Error fetching {fetched_url}: {e}")
+        print(f"Error fetching {url}: {e}. Trying playwright fallback...")
+        pw_desc = await fetch_with_playwright(url)
+        if pw_desc:
+            return {
+                "original_url": original_url,
+                "fetched_url": url,
+                "date": date,
+                "description": pw_desc
+            }
         return None
 
 async def parse_backups():
@@ -63,7 +132,15 @@ async def parse_backups():
     seen_urls = set()
 
     async with aiohttp.ClientSession(
-        headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"},
+        headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Referer": "https://www.google.com/",
+            "DNT": "1",
+            "Connection": "keep-alive",
+            "Upgrade-Insecure-Requests": "1",
+        },
         connector=aiohttp.TCPConnector(ssl=False)
     ) as session:
         for filename in os.listdir(backup_dir):
